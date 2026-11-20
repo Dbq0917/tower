@@ -5,7 +5,10 @@ mod support;
 use std::future;
 
 use tokio_test::{assert_pending, assert_ready_err, assert_ready_ok, task};
-use tower::retry::Policy;
+use tower::retry::{
+    classify::{classify, ClassifiedError},
+    Policy,
+};
 use tower_test::{assert_request_eq, mock};
 
 #[tokio::test(flavor = "current_thread")]
@@ -112,6 +115,72 @@ async fn retry_mutating_policy() {
     assert_ready_err!(fut.poll(), "out of retries");
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn non_retryable_error_is_not_retried() {
+    let _t = support::trace_init();
+
+    let (mut service, mut handle) = new_service(ClassifiedRetry::new(2));
+
+    assert_ready_ok!(service.poll_ready());
+    let mut fut = task::spawn(service.call("hello"));
+
+    // The downstream failure is marked permanent (e.g. invalid argument or
+    // permission denied) and re-wrapped by every layer in the stack.
+    assert_request_eq!(handle, "hello").send_error(rewrap(ClassifiedError::permanent(Box::new(
+        io_error("invalid argument"),
+    ))));
+
+    // The policy sees the reason through the wrapper chain and gives up
+    // immediately: the request reaches the downstream service exactly once.
+    let err = assert_ready_err!(fut.poll());
+    assert_eq!(classify(err.as_ref()), Some(false));
+    assert_pending!(handle.poll_request(), "no retry attempted");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn retryable_error_still_uses_the_attempt_limit() {
+    let _t = support::trace_init();
+
+    let (mut service, mut handle) = new_service(ClassifiedRetry::new(2));
+
+    assert_ready_ok!(service.poll_ready());
+    let mut fut = task::spawn(service.call("hello"));
+
+    assert_request_eq!(handle, "hello").send_error(rewrap(ClassifiedError::retryable(Box::new(
+        io_error("connection reset"),
+    ))));
+    assert_pending!(fut.poll());
+
+    assert_request_eq!(handle, "hello").send_error(rewrap(ClassifiedError::retryable(Box::new(
+        io_error("connection reset"),
+    ))));
+    assert_pending!(fut.poll());
+
+    assert_request_eq!(handle, "hello").send_error(rewrap(ClassifiedError::retryable(Box::new(
+        io_error("connection reset"),
+    ))));
+    let err = assert_ready_err!(fut.poll());
+    assert_eq!(classify(err.as_ref()), Some(true));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn unclassified_error_falls_back_to_attempt_limit() {
+    let _t = support::trace_init();
+
+    let (mut service, mut handle) = new_service(ClassifiedRetry::new(1));
+
+    assert_ready_ok!(service.poll_ready());
+    let mut fut = task::spawn(service.call("hello"));
+
+    // An error without any classification is treated with the legacy
+    // count-based behavior.
+    assert_request_eq!(handle, "hello").send_error(rewrap(io_error("unclassified")));
+    assert_pending!(fut.poll());
+
+    assert_request_eq!(handle, "hello").send_error(rewrap(io_error("unclassified")));
+    assert_ready_err!(fut.poll());
+}
+
 type Req = &'static str;
 type Res = &'static str;
 type InnerError = &'static str;
@@ -187,6 +256,80 @@ impl Policy<Req, Res, Error> for CannotClone {
 
     fn clone_request(&mut self, _req: &Req) -> Option<Req> {
         None
+    }
+}
+
+/// Retry policy that makes its decision from the error's reason instead of
+/// blindly counting attempts.
+///
+/// A non-retryable classification found anywhere in the error chain ends the
+/// request session immediately. Retryable and unclassified errors are retried
+/// until `remaining` attempts are used up.
+#[derive(Clone)]
+struct ClassifiedRetry {
+    remaining: usize,
+}
+
+impl ClassifiedRetry {
+    fn new(max_retries: usize) -> Self {
+        ClassifiedRetry {
+            remaining: max_retries,
+        }
+    }
+}
+
+impl Policy<Req, Res, Error> for ClassifiedRetry {
+    type Future = future::Ready<()>;
+
+    fn retry(&mut self, _: &mut Req, result: &mut Result<Res, Error>) -> Option<Self::Future> {
+        let err = result.as_ref().err()?;
+
+        match classify(err.as_ref()) {
+            // The reason is visible: permanent failures are never retried.
+            Some(false) => None,
+            // Transient failures consume an attempt like before.
+            Some(true) if self.remaining == 0 => None,
+            Some(true) => {
+                self.remaining -= 1;
+                Some(future::ready(()))
+            }
+            // No layer attached a classification; keep the legacy behavior.
+            None if self.remaining == 0 => None,
+            None => {
+                self.remaining -= 1;
+                Some(future::ready(()))
+            }
+        }
+    }
+
+    fn clone_request(&mut self, req: &Req) -> Option<Req> {
+        Some(*req)
+    }
+}
+
+/// Simulates a middleware layer re-wrapping an error the way `?` into a
+/// `BoxError` would: the outer type stays the same, only the
+/// `source` chain gains another link.
+fn rewrap(err: impl std::error::Error + Send + Sync + 'static) -> Error {
+    Box::new(Wrapped(Box::new(err)))
+}
+
+fn io_error(message: &'static str) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::Other, message)
+}
+
+#[derive(Debug)]
+struct Wrapped(Error);
+
+impl std::fmt::Display for Wrapped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "wrapped")
+    }
+}
+
+impl std::error::Error for Wrapped {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.0.as_ref())
     }
 }
 

@@ -2,6 +2,7 @@
 
 pub mod backoff;
 pub mod budget;
+pub mod classify;
 pub mod future;
 mod layer;
 mod policy;
