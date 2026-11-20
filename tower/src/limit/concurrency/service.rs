@@ -74,8 +74,20 @@ where
         }
 
         // Once we've acquired a permit (or if we already had one), poll the
-        // inner service.
-        self.inner.poll_ready(cx)
+        // inner service. If the request cannot enter execution yet, release
+        // the permit; holding it while waiting for readiness would park
+        // concurrency capacity even though no request is in flight.
+        match self.inner.poll_ready(cx) {
+            Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
+            Poll::Ready(Err(e)) => {
+                self.permit = None;
+                Poll::Ready(Err(e))
+            }
+            Poll::Pending => {
+                self.permit = None;
+                Poll::Pending
+            }
+        }
     }
 
     fn call(&mut self, request: Request) -> Self::Future {

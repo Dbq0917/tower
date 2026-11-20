@@ -2,7 +2,7 @@
 #[path = "../support.rs"]
 mod support;
 
-use tokio_test::{assert_ready_err, assert_ready_ok, task};
+use tokio_test::{assert_pending, assert_ready_err, assert_ready_ok, task};
 use tower::load_shed::LoadShedLayer;
 use tower_test::{assert_request_eq, mock};
 
@@ -36,4 +36,22 @@ async fn when_not_ready() {
 
     let err = assert_ready_err!(fut.poll());
     assert!(err.is::<tower::load_shed::error::Overloaded>());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn readiness_error_clears_previous_readiness() {
+    let _t = support::trace_init();
+
+    let layer = LoadShedLayer::new();
+    let (mut service, mut handle) = mock::spawn_layer::<_, &'static str, _>(layer);
+
+    assert_ready_ok!(service.poll_ready(), "overload always reports ready");
+
+    handle.send_error("downstream failed to become ready");
+    assert_ready_err!(service.poll_ready());
+
+    let mut fut = task::spawn(service.call("hello"));
+    let err = assert_ready_err!(fut.poll());
+    assert!(err.is::<tower::load_shed::error::Overloaded>());
+    assert_pending!(handle.poll_request());
 }

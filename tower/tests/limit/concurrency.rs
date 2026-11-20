@@ -103,6 +103,23 @@ async fn request_without_capacity() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn not_ready_inner_does_not_park_capacity() {
+    let _t = support::trace_init();
+    let limit = ConcurrencyLimitLayer::new(1);
+    let (mut stalled, mut handle) = mock::spawn_layer::<(), (), _>(limit);
+    let mut other = stalled.clone();
+
+    handle.allow(0);
+    assert_pending!(stalled.poll_ready());
+
+    // The first clone must not hold the only permit while its inner service is
+    // not ready. Otherwise another clone can never make progress even though
+    // no request is in flight.
+    handle.allow(1);
+    assert_ready_ok!(other.poll_ready());
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn reserve_capacity_without_sending_request() {
     let _t = support::trace_init();
     let limit = ConcurrencyLimitLayer::new(1);

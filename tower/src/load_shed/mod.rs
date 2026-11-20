@@ -44,7 +44,14 @@ where
         // We check for readiness here, so that we can know in `call` if
         // the inner service is overloaded or not.
         self.is_ready = match self.inner.poll_ready(cx) {
-            Poll::Ready(Err(e)) => return Poll::Ready(Err(e.into())),
+            Poll::Ready(Err(e)) => {
+                // A service that errors from readiness is done. Clear the
+                // previous readiness so a caller that retries readiness
+                // instead of dropping the service cannot forward a request to
+                // it later.
+                self.is_ready = false;
+                return Poll::Ready(Err(e.into()));
+            }
             r => r.is_ready(),
         };
 
