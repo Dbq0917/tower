@@ -22,6 +22,7 @@ rust-version = "1.64.0"
 [features]
 full = [
   "balance",
+  "budget",
   "buffer",
   "discover",
   "filter",
@@ -41,6 +42,7 @@ full = [
 # FIXME: Use weak dependency once available (https://github.com/rust-lang/cargo/issues/8832)
 log = ["tracing/log"]
 balance = ["discover", "load", "ready-cache", "make", "slab", "util"]
+budget = ["retry", "timeout", "pin-project-lite", "tokio/time"]
 buffer = ["tokio/sync", "tokio/rt", "tokio-util", "tracing", "pin-project-lite"]
 discover = ["futures-core", "pin-project-lite"]
 filter = ["futures-util", "pin-project-lite"]
